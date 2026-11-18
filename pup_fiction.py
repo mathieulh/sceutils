@@ -409,7 +409,7 @@ def slb2_extract(src, dst):
 
 # ------------------------------------------------------------------------------
 # SLSK (second_loader.enc / secure_kernel.enc) decryption
-# Port of Proxima's slsk_tool.py / slsk_tool_type2.py.
+# Port of Proxima's slsk_tool.py
 # ------------------------------------------------------------------------------
 SLSK_HEADER_FMT = "<IIIIIHHII"
 
