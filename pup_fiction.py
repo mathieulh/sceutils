@@ -1,4 +1,5 @@
 #!/usr/bin/env python2
+from __future__ import print_function
 
 from sys import argv
 import struct
@@ -8,16 +9,22 @@ import glob
 import subprocess
 import errno
 import sys
+import hashlib
+import hmac
+import binascii
+import zlib
 
 from Crypto.Cipher import AES
 
 from util import u32, u8, c_str
 from scedecrypt import scedecrypt
 from self2elf import self2elf
+from scetypes import KeyType, SceType, SelfType
+import keys
 
 unarzl_exe = os.path.join(os.path.dirname(os.path.realpath(__file__)), "unarzl", "unarzl")
 if not os.path.exists(unarzl_exe):
-    print "Please cd to unarzl and type make"
+    print("Please cd to unarzl and type make")
     sys.exit(-1)
 
 SCEUF_HEADER_SIZE = 0x80
@@ -67,6 +74,233 @@ FSTYPE = [
 
 g_typecount = defaultdict(int)
 
+
+# ------------------------------------------------------------------------------
+# Runtime key discovery
+#
+# keys.py only holds the SPKG + SLSK (+ NPDRM) keys. All other metadata keys
+# are looked up in already-decrypted modules ("key sources"):
+#   second_loader.bin  -> BOOT     (kernel_boot_loader.self)
+#   secure_kernel.bin  -> SECURE, SRVK (kprx_auth_sm.self, prog_rvk.srvk, sm)
+#   kprx_auth_sm.elf   -> KERNEL, USER, APP
+#
+# A key is accepted only if it decrypts the target's metadata info block and
+# both 16-byte padding fields come out as zero, then the metadata header is
+# checked for sane values. Keys are stored as key[32] followed by iv[16]; if
+# the adjacent IV doesn't validate, nearby 16-byte windows are tried.
+# ------------------------------------------------------------------------------
+SCE_HEADER_FMT = "<4sIBBHIQQ"
+SCE_HEADER_SIZE = 0x20
+META_INFO_SIZE = 0x40
+FULL_RANGE = (0x00000000000, 0xFFFFFFFFFFFFFFFFFFFFFF)
+
+
+def _enum(enum_cls, value):
+    try:
+        return enum_cls(value)
+    except Exception:
+        pass
+    for name in dir(enum_cls):
+        member = getattr(enum_cls, name)
+        if getattr(member, "value", member) == value and not name.startswith("_"):
+            return member
+    raise KeyError("unknown {} value {}".format(enum_cls.__name__, value))
+
+
+def _enum_name(member):
+    return getattr(member, "name", str(member))
+
+
+class SceTarget(object):
+    """Header data needed to find / validate the metadata key of an SCE file."""
+
+    def __init__(self, data):
+        if len(data) < SCE_HEADER_SIZE or data[0:4] != b"SCE\x00":
+            raise ValueError("not an SCE file")
+        (_magic, _ver, _plat, self.key_rev, self.sce_type, self.meta_offset,
+         self.header_len, _dlen) = struct.unpack(SCE_HEADER_FMT, data[0:SCE_HEADER_SIZE])
+        self.self_type = 0
+        if self.sce_type == 1:  # SELF -> app info self_type
+            appinfo_off = struct.unpack("<Q", data[0x38:0x40])[0]
+            self.self_type = struct.unpack("<I", data[appinfo_off + 12:appinfo_off + 16])[0]
+        base = self.meta_offset + 48
+        self.meta_info = data[base:base + META_INFO_SIZE]
+        hdr = data[base + META_INFO_SIZE:self.header_len]
+        self.meta_hdr = hdr[0:32]
+        if len(self.meta_info) != META_INFO_SIZE or len(self.meta_hdr) != 32:
+            raise ValueError("truncated SCE header")
+        c = self.meta_info
+        self.c1, self.c2, self.c3, self.c4 = c[0:16], c[16:32], c[32:48], c[48:64]
+
+    @property
+    def slot(self):
+        return (self.sce_type, self.self_type, self.key_rev)
+
+    def quick_check(self, key):
+        """IV-independent: block 2 and 4 of the metadata info are zero padding."""
+        ecb = AES.new(key, AES.MODE_ECB)
+        return ecb.decrypt(self.c2) == self.c1 and ecb.decrypt(self.c4) == self.c3
+
+    def full_check(self, key, iv):
+        if not self.quick_check(key):
+            return False
+        info = AES.new(key, AES.MODE_CBC, iv).decrypt(self.meta_info)
+        mkey, miv = info[0:16], info[32:48]
+        mh = AES.new(mkey, AES.MODE_CBC, miv).decrypt(self.meta_hdr)
+        _siglen, _u1, sec_count, key_count, _opt, _u2, _u3 = struct.unpack("<QIIIIII", mh)
+        return 0 < sec_count <= 0x100 and key_count <= 0x400
+
+
+def read_sce_target(path):
+    with open(path, "rb") as fin:
+        data = fin.read(SCE_HEADER_SIZE)
+        if len(data) < SCE_HEADER_SIZE or data[0:4] != b"SCE\x00":
+            return None
+        header_len = struct.unpack(SCE_HEADER_FMT, data)[6]
+        if header_len > 0x100000:
+            return None
+        fin.seek(0)
+        data = fin.read(header_len)
+    try:
+        return SceTarget(data)
+    except (ValueError, struct.error):
+        return None
+
+
+class KeyResolver(object):
+    def __init__(self, scan_step=4):
+        self.sources = []          # (name, bytes)
+        self.found = defaultdict(list)   # slot -> [(key, iv, origin)]
+        self.miss = {}             # slot -> number of sources when last scan failed
+        self.scan_step = scan_step
+        self.spkg = [(binascii.unhexlify(k), binascii.unhexlify(i), label)
+                     for k, i, label in keys.SPKG_KEYS]
+
+    def add_source(self, path, name=None):
+        if not os.path.exists(path):
+            return False
+        with open(path, "rb") as fin:
+            data = fin.read()
+        self.sources.append((name or os.path.basename(path), data))
+        return True
+
+    def _scan(self, target):
+        step = self.scan_step
+        for name, buf in self.sources:
+            end = len(buf) - 48
+            for off in range(0, end + 1, step):
+                key = buf[off:off + 32]
+                if key.count(b"\x00") > 8:
+                    continue
+                if not target.quick_check(key):
+                    continue
+                iv = buf[off + 32:off + 48]
+                if target.full_check(key, iv):
+                    return key, iv, "{}+0x{:X}".format(name, off)
+                lo, hi = max(0, off - 0x200), min(len(buf) - 16, off + 0x200)
+                for ivoff in range(lo - lo % 4, hi + 1, 4):
+                    iv = buf[ivoff:ivoff + 16]
+                    if target.full_check(key, iv):
+                        return key, iv, "{}+0x{:X} (iv +0x{:X})".format(name, off, ivoff)
+        return None
+
+    def resolve(self, target):
+        """Return (key, iv, origin) for the target, or None."""
+        if target.sce_type == 3:  # SPKG: fixed list from keys.py
+            for key, iv, label in self.spkg:
+                if target.full_check(key, iv):
+                    return key, iv, "keys.py SPKG ({})".format(label)
+            return None
+        for entry in self.found[target.slot]:
+            if target.full_check(entry[0], entry[1]):
+                return entry
+        if self.miss.get(target.slot) == len(self.sources):
+            return None
+        hit = self._scan(target)
+        if hit is None:
+            self.miss[target.slot] = len(self.sources)
+            return None
+        self.found[target.slot].append(hit)
+        sce = _enum_name(_enum(SceType, target.sce_type))
+        st = _enum_name(_enum(SelfType, target.self_type))
+        print("    [+] found {} {} keyrev {} key in {}".format(sce, st, target.key_rev, hit[2]))
+        return hit
+
+    def activate(self, target, entry):
+        """Make keys.SCE_KEYS return exactly this key for the target."""
+        store = keys.SCE_KEYS
+        store.__dict__.clear()
+        store.__init__()
+        keys.register_npdrm_keys(store)
+        store.register(KeyType.METADATA, _enum(SceType, target.sce_type), target.key_rev,
+                       str(binascii.hexlify(entry[0]).decode("ascii").upper()),
+                       str(binascii.hexlify(entry[1]).decode("ascii").upper()),
+                       FULL_RANGE[0], FULL_RANGE[1], _enum(SelfType, target.self_type))
+
+    def prepare(self, path):
+        """Resolve + activate the key for an SCE file. Returns origin or None."""
+        target = read_sce_target(path)
+        if target is None:
+            return None
+        entry = self.resolve(target)
+        if entry is None:
+            return None
+        self.activate(target, entry)
+        return entry[2]
+
+    def write_derived(self, path):
+        with open(path, "w") as fout:
+            fout.write("# Keys discovered by pup_fiction.py (key[32] + iv[16] found in decrypted modules)\n")
+            fout.write("from scetypes import *\n\nSCE_KEYS = KeyStore()\n")
+            for slot in sorted(self.found):
+                sce_type, self_type, rev = slot
+                for key, iv, origin in self.found[slot]:
+                    fout.write("\n# {}\nSCE_KEYS.register(\n".format(origin))
+                    fout.write("    KeyType.METADATA,\n    SceType.{},\n    {},\n".format(
+                        _enum_name(_enum(SceType, sce_type)), rev))
+                    fout.write("    '{}',\n    '{}',\n".format(
+                        binascii.hexlify(key).decode("ascii").upper(),
+                        binascii.hexlify(iv).decode("ascii").upper()))
+                    fout.write("    0x00000000000,\n    0xFFFFFFFFFFFFFFFFFFFFFF,\n    SelfType.{}\n)\n".format(
+                        _enum_name(_enum(SelfType, self_type))))
+
+
+RESOLVER = KeyResolver()
+
+
+def run_sce(path, action, label=None):
+    """Find the key for `path`, then run `action()` (scedecrypt/self2elf call)."""
+    label = label or os.path.basename(path)
+    origin = RESOLVER.prepare(path)
+    if origin is None:
+        print("[!] no key {}".format(label))
+        return False
+    try:
+        action()
+    except KeyError as e:
+        print("[!] Couldn't decrypt {}: {}".format(label, e))
+        return False
+    return True
+
+
+def sce_decrypt_file(path, dst, label=None):
+    def go():
+        with open(path, "rb") as fin:
+            scedecrypt(fin, dst, silent=True)
+    return run_sce(path, go, label)
+
+
+def self2elf_file(path, out_path, label=None, **kw):
+    def go():
+        with open(path, "rb") as fin:
+            with open(out_path, "wb") as fout:
+                self2elf(fin, fout, silent=True, **kw)
+    ok = run_sce(path, go, label)
+    if not ok and os.path.exists(out_path) and os.path.getsize(out_path) == 0:
+        os.remove(out_path)
+    return ok
+
+
 def make_filename(hdr, filetype):
     magic, version, flags, moffs, metaoffs = struct.unpack("<IIIIQ", hdr[0:24])
     if magic == 0x454353 and version == 3 and flags == 0x30040:
@@ -82,18 +316,18 @@ def make_filename(hdr, filetype):
 def pup_extract_files(pup, output):
     with open(pup, "rb") as fin:
         header = fin.read(SCEUF_HEADER_SIZE)
-        if header[0:5] != "SCEUF":
-            print "Invalid PUP"
+        if header[0:5] != b"SCEUF":
+            print("Invalid PUP")
             return -1
 
         cnt = u32(header, 0x18)
 
-        print "-" * 80
-        print "PUP Version: 0x{:x}".format(u32(header, 8))
-        print "Firmware Version: 0x{:08X}".format(u32(header, 0x10))
-        print "Build Number: {}".format(u32(header, 0x14))
-        print "Number of Files: {}".format(cnt)
-        print "-" * 80
+        print("-" * 80)
+        print("PUP Version: 0x{:x}".format(u32(header, 8)))
+        print("Firmware Version: 0x{:08X}".format(u32(header, 0x10)))
+        print("Build Number: {}".format(u32(header, 0x14)))
+        print("Number of Files: {}".format(cnt))
+        print("-" * 80)
 
         for x in range(cnt):
             fin.seek(SCEUF_HEADER_SIZE + x * SCEUF_FILEREC_SIZE)
@@ -110,9 +344,9 @@ def pup_extract_files(pup, output):
             with open(os.path.join(output, filename), "wb") as fout:
                 fin.seek(offset)
                 fout.write(fin.read(length))
-            print "- {}".format(filename)
+            print("- {}".format(filename))
 
-        print "-" * 80
+        print("-" * 80)
 
 
 def join_files(mask, output):
@@ -129,28 +363,25 @@ def pup_decrypt_packages(src, dst):
     files.sort()
 
     for filename in files:
-        filepath = os.path.join(src, filename)
-        with open(filepath, "rb") as fin:
-            try:
-                scedecrypt(fin, dst, silent=True)
-                print "Decrypted {}".format(filename)
-            except KeyError:
-                print "[!] Couldn't decrypt {}".format(filename)
-
-    for filename in ["cui_setupper.self", "psp2swu.self"]:
-        filepath = os.path.join(src, filename)
-        with open(filepath, "rb") as fin:
-            with open(os.path.join(dst, filename.replace(".self", ".elf")), "wb") as fout:
-                try:
-                    self2elf(fin, fout, silent=True, ignore_sysver=True)
-                    print "Decrypted {}".format(filename)
-                except KeyError:
-                    print "[!] Couldn't decrypt {}".format(filename)
+        if sce_decrypt_file(os.path.join(src, filename), dst, filename):
+            print("Decrypted {}".format(filename))
 
     join_files(os.path.join(dst, "os0-*.pkg.seg02"), os.path.join(dst, "os0.bin"))
     join_files(os.path.join(dst, "vs0-*.pkg.seg02"), os.path.join(dst, "vs0.bin"))
 
-    print "-" * 80
+    print("-" * 80)
+
+
+def decrypt_updater_selfs(src, dst):
+    # Needs USER/APP keys -> must run after kprx_auth_sm has been decrypted
+    for filename in ["cui_setupper.self", "psp2swu.self"]:
+        filepath = os.path.join(src, filename)
+        if not os.path.exists(filepath):
+            continue
+        out_path = os.path.join(dst, filename.replace(".self", ".elf"))
+        if self2elf_file(filepath, out_path, filename, ignore_sysver=True):
+            print("Decrypted {}".format(filename))
+    print("-" * 80)
 
 
 def slb2_extract(src, dst):
@@ -159,7 +390,7 @@ def slb2_extract(src, dst):
         magic, version, flags, file_count, total_blocks = struct.unpack("<IIIII", hdr[0:20])
         if magic != 0x32424C53:
             raise RuntimeError("Invalid SLB2 file")
-        print "SLB2 version: {}, flags: 0x{:X}, file_count: {}, total_blocks: 0x{:X}".format(version, flags, file_count, total_blocks)
+        print("SLB2 version: {}, flags: 0x{:X}, file_count: {}, total_blocks: 0x{:X}".format(version, flags, file_count, total_blocks))
 
         for x in range(file_count):
             entry_start = 0x20 + x * 0x30
@@ -171,52 +402,155 @@ def slb2_extract(src, dst):
             with open(os.path.join(dst, filename), "wb") as fout:
                 fin.seek(block_offset * 0x200)
                 fout.write(fin.read(filesize))
-                print "- {}".format(filename)
+                print("- {}".format(filename))
 
-    print "-" * 80
+    print("-" * 80)
+
+
+# ------------------------------------------------------------------------------
+# SLSK (second_loader.enc / secure_kernel.enc) decryption
+# Port of Proxima's slsk_tool.py / slsk_tool_type2.py.
+# ------------------------------------------------------------------------------
+SLSK_HEADER_FMT = "<IIIIIHHII"
+
+
+class SlskError(RuntimeError):
+    pass
+
+
+def _hx(b):
+    return binascii.hexlify(bytes(b)).decode("ascii").upper()
+
+
+def _int_from_le(b):
+    return int(binascii.hexlify(bytes(bytearray(b)[::-1])), 16)
+
+
+def _int_to_be(n, length):
+    return binascii.unhexlify("%0*x" % (length * 2, n))
+
+
+def _hmac_sha256(key, data):
+    return hmac.new(key, bytes(data), hashlib.sha256).digest()
+
+
+def _slsk_check_header_sig(data, headersize, rsaver):
+    warnings = []
+    rsa_keys = keys.SLSK_RSA_KEYS
+    modulus = rsa_keys[rsaver] if rsaver < len(rsa_keys) else rsa_keys[-1]
+    sig = _int_from_le(data[headersize - 0x100:headersize])
+    dec = _int_to_be(pow(sig, keys.SLSK_RSA_EXPONENT, modulus), 0x100)
+    if dec[0:0xCE] != b"\x00\x01" + b"\xff" * 0xCB + b"\x00":
+        warnings.append("invalid RSA signature padding")
+        return warnings
+    if dec[0xCE:0xE0] != keys.SLSK_RSA_STATIC:
+        warnings.append("invalid RSA signature static data")
+    if dec[0xE0:0x100] != _hmac_sha256(keys.SLSK_HMAC_KEY, data[:headersize - 0x100]):
+        warnings.append("header HMAC mismatch")
+    return warnings
+
+
+def slsk_decrypt_data(data):
+    """Returns (plaintext_body, info). Raises SlskError."""
+    data = bytearray(data)
+    if len(data) < 0x40:
+        raise SlskError("file too small")
+    (magic, headersize, versionsize, _revokesize, bodysize,
+     encver, rsaver, _f1, _f2) = struct.unpack(SLSK_HEADER_FMT, bytes(data[0:0x20]))
+    filehash = bytes(data[0x20:0x40])
+    if magic != keys.SLSK_MAGIC:
+        raise SlskError("invalid magic 0x{:08X}".format(magic))
+    if headersize < 0x1E0 or headersize + bodysize > len(data) or bodysize % 0x10:
+        raise SlskError("inconsistent sizes (header 0x{:X}, body 0x{:X}, file 0x{:X})".format(
+            headersize, bodysize, len(data)))
+
+    info = {"key_revision": encver, "version": None, "key_set": None, "warnings": []}
+    if versionsize > 0:
+        info["version"] = bytes(data[0x40:0x40 + versionsize]).decode("utf-8", "replace").rstrip("\x00")
+
+    pck_key = getattr(keys, "SLSK_PCK_KEY", None)
+    if pck_key:
+        start, end = 0xD0 + versionsize, headersize + bodysize
+        if len(pck_key) not in (16, 24, 32):
+            pck_key = binascii.unhexlify(pck_key)
+        data[start:end] = AES.new(pck_key, AES.MODE_CBC, keys.SLSK_PCK_IV).decrypt(bytes(data[start:end]))
+
+    info["warnings"] += _slsk_check_header_sig(data, headersize, rsaver)
+
+    enc_body = bytes(data[headersize:headersize + bodysize])
+    body_hmac = _hmac_sha256(keys.SLSK_HMAC_KEY, enc_body)
+    enc_bodykey = bytes(data[headersize - 0x1E0:headersize - 0x1C0])
+    enc_hdrhmac = bytes(data[headersize - 0x120:headersize - 0x100])
+    if encver >= len(keys.SLSK_KEY_IVS):
+        raise SlskError("no key IV for key revision {}".format(encver))
+
+    for set_name, masters in keys.SLSK_MASTER_KEYS:
+        if encver >= len(masters):
+            continue
+        bodykey = AES.new(masters[encver], AES.MODE_CBC, keys.SLSK_KEY_IVS[encver]).decrypt(enc_bodykey)
+        if AES.new(bodykey, AES.MODE_CBC, keys.SLSK_HDR_HMAC_IV).decrypt(enc_hdrhmac) != body_hmac:
+            continue
+        body = AES.new(bodykey[0:0x10], AES.MODE_CBC, keys.SLSK_BODY_IV).decrypt(enc_body)
+        if hashlib.sha256(body).digest() != filehash:
+            raise SlskError("key set {} matched body HMAC but plaintext SHA-256 differs".format(set_name))
+        info["key_set"] = set_name
+        return body, info
+
+    enc_key = getattr(keys, "ENC_KEY", None)
+    if enc_key:
+        body = AES.new(enc_key, AES.MODE_CBC, getattr(keys, "ENC_IV", keys.SLSK_BODY_IV)).decrypt(enc_body)
+        if hashlib.sha256(body).digest() == filehash:
+            info["key_set"] = "legacy ENC_KEY"
+            info["warnings"].append("decrypted with legacy ENC_KEY (no master key set matched)")
+            return body, info
+
+    raise SlskError("no SLSK master key set matches (key revision {})".format(encver))
 
 
 def enc_decrypt(src, dst):
-    from keys import ENC_KEY, ENC_IV
-
     with open(src, "rb") as fin:
         data = fin.read()
-
-    magic, offset, plaintext_size, unk, data_size = struct.unpack("<IIIII", data[0:20])
-
-    if magic != 0x64B2C8E5:
-        raise RuntimeError("enc format invalid")
-
-    data = data[offset:offset+data_size]
-    aes = AES.new(ENC_KEY, AES.MODE_CBC, ENC_IV)
+    body, info = slsk_decrypt_data(data)
     with open(dst, "wb") as fout:
-        fout.write(aes.decrypt(data))
+        fout.write(body)
+    return info
 
 
 def slb2_decrypt(src, dst):
+    # 1. SLSK: keys.py SLSK keys -> second_loader.bin / secure_kernel.bin
     for filename in ["second_loader.enc", "secure_kernel.enc"]:
         dst_filename = filename.replace(".enc", ".bin")
-        enc_decrypt(os.path.join(src, filename), os.path.join(dst, dst_filename))
-        print "Decrypted {} to {}".format(filename, dst_filename)
+        try:
+            info = enc_decrypt(os.path.join(src, filename), os.path.join(dst, dst_filename))
+        except (SlskError, IOError) as e:
+            print("[!] Couldn't decrypt {}: {}".format(filename, e))
+            continue
+        print("Decrypted {} to {} (key set {}, key rev {}{})".format(
+            filename, dst_filename, info["key_set"], info["key_revision"],
+            ", version {}".format(info["version"]) if info["version"] else ""))
+        for w in info["warnings"]:
+            print("    [!] {}".format(w))
+        RESOLVER.add_source(os.path.join(dst, dst_filename))
 
+    # 2. BOOT / SRVK keys come from second_loader / secure_kernel
     for filename in ["kernel_boot_loader.self", "prog_rvk.srvk"]:
-        filepath = os.path.join(src, filename)
-        with open(filepath, "rb") as fin:
-            scedecrypt(fin, dst, silent=True)
-        print "Decrypted {}".format(filename)
+        if sce_decrypt_file(os.path.join(src, filename), dst, filename):
+            print("Decrypted {}".format(filename))
 
+    # 3. SECURE key -> kprx_auth_sm, which holds the KERNEL/USER/APP keys
     for filename in ["kprx_auth_sm.self"]:
         dst_filename = filename.replace(".self", ".elf")
+        out_path = os.path.join(dst, dst_filename)
+        if self2elf_file(os.path.join(src, filename), out_path, filename):
+            print("self2elf {}".format(filename))
+            RESOLVER.add_source(out_path)
 
-        print "self2elf {}".format(filename)
-        with open(os.path.join(src, filename), "rb") as fin:
-            with open(os.path.join(dst, dst_filename), "wb") as fout:
-                self2elf(fin, fout, silent=True)
+    nsbl_in = os.path.join(dst, "kernel_boot_loader.self.seg03")
+    if os.path.exists(nsbl_in):
+        print("unarzl nsbl.bin")
+        subprocess.call([unarzl_exe, nsbl_in, os.path.join(dst, "nsbl.bin")])
 
-    print "unarzl nsbl.bin"
-    subprocess.call([unarzl_exe, os.path.join(dst, "kernel_boot_loader.self.seg03"), os.path.join(dst, "nsbl.bin")])
-
-    print "-" * 80
+    print("-" * 80)
 
 
 def extract_fs(output):
@@ -224,7 +558,7 @@ def extract_fs(output):
     os.mkdir(fs_output)
 
     for partition in ["os0", "vs0"]:
-        print "Extract {}".format(partition)
+        print("Extract {}".format(partition))
         partition_in = os.path.join(output, "PUP_dec", "{}.bin".format(partition))
         partition_out = os.path.join(fs_output, partition)
         os.mkdir(partition_out)
@@ -233,10 +567,10 @@ def extract_fs(output):
 
     vs0_tarpatch = os.path.join(output, "fs", "vs0_tarpatch")
     for filename in glob.glob(os.path.join(output, "PUP_dec", "vs0_tarpatch-*.pkg.seg02")):
-        print "tarpatch {}".format(os.path.basename(filename))
+        print("tarpatch {}".format(os.path.basename(filename)))
         subprocess.call(["7z", "x", filename, "-o{}".format(vs0_tarpatch)], stdout=open(os.devnull, 'wb'), stderr=open(os.devnull, 'wb'))
 
-    print "-" * 80
+    print("-" * 80)
 
 
 def mkdir_p(path):
@@ -256,18 +590,12 @@ def decrypt_selfs(in_dir, out_dir, blacklist=None):
     for root, dirs, files in os.walk(in_dir):
         for filename in files:
             name, ext = os.path.splitext(filename)
-            if ext in [".self", ".skprx", ".suprx"] and filename not in blacklist:
+            if (ext in [".self", ".skprx", ".suprx"] or filename == "eboot.bin") and filename not in blacklist:
                 relpath = os.path.relpath(root, in_dir)
                 mkdir_p(os.path.join(out_dir, relpath))
-
-                try:
-                    with open(os.path.join(root, filename), "rb") as fin:
-                        with open(os.path.join(out_dir, relpath, "{}.elf".format(name)), "wb") as fout:
-                            self2elf(fin, fout, silent=True)
-                    print "self2elf {}".format(filename)
-                except KeyError:
-                    print "[!] no key {}".format(filename)
-
+                out_path = os.path.join(out_dir, relpath, "{}.elf".format(name))
+                if self2elf_file(os.path.join(root, filename), out_path, filename):
+                    print("self2elf {}".format(filename))
 
 
 def decrypt_os0(output):
@@ -280,10 +608,10 @@ def decrypt_os0(output):
     for filename in configs:
         in_path = os.path.join(os0_in, filename)
         if os.path.exists(in_path):
-            print "Decrypt {}".format(filename)
-            with open(in_path, "rb") as fin:
-                scedecrypt(fin, os0_out, silent=True)
-    print "-" * 80
+            print("Decrypt {}".format(filename))
+            mkdir_p(os0_out)
+            sce_decrypt_file(in_path, os0_out, filename)
+    print("-" * 80)
 
 
 def decrypt_vs0(output):
@@ -291,15 +619,15 @@ def decrypt_vs0(output):
         vs0_in = os.path.join(output, "fs", part)
         vs0_out = os.path.join(output, "fs_dec", part)
         decrypt_selfs(vs0_in, vs0_out)
-    print "-" * 80
+    print("-" * 80)
 
 
 def extract_pup(pup, output):
     if os.path.exists(output):
-        print "{} already exists, remove it first".format(output)
+        print("{} already exists, remove it first".format(output))
         return
 
-    print "Extracting {} to {}".format(pup, output)
+    print("Extracting {} to {}".format(pup, output))
 
     os.mkdir(output)
 
@@ -322,16 +650,23 @@ def extract_pup(pup, output):
     os.mkdir(slb2_dec)
     slb2_decrypt(slb2_dst, slb2_dec)
 
+    decrypt_updater_selfs(pup_dst, pup_dec)
+
     extract_fs(output)
 
     os.mkdir(os.path.join(output, "fs_dec"))
     decrypt_os0(output)
     decrypt_vs0(output)
 
+    derived = os.path.join(output, "derived_keys.py")
+    RESOLVER.write_derived(derived)
+    print("Discovered {} key(s), saved to {}".format(
+        sum(len(v) for v in RESOLVER.found.values()), derived))
+
 
 def main():
     if len(argv) != 3:
-        print "Usage: ./pup_fiction.py FILE.PUP output-dir/"
+        print("Usage: ./pup_fiction.py FILE.PUP output-dir/")
         return 1
     extract_pup(argv[1], argv[2])
 
