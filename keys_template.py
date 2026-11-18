@@ -81,8 +81,8 @@ SLSK_MAGIC = 0x64B2C8E5          # file magic, not a key
 # Revision". Each set is tried in order; the one whose body HMAC matches
 # is used.
 _SLSK_MASTER_KEYS = [
-    ('type1', ['', '', '', '', '', '']),
     ('type2', ['', '', '', '', '', '']),
+    ('type3', ['', '', '', '', '', '']),
 ]
 
 # IVs used to decrypt the body key (16 bytes), indexed by key revision
